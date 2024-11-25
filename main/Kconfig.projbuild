@@ -1,0 +1,16 @@
+menu "Role Configuration"
+
+    choice "Role"
+        prompt "Select Sender or Receiver"
+        default SENDER
+    
+    config SENDER
+        bool "Sender"
+    
+    config RECEIVER
+        bool "Receiver"
+    
+    endchoice
+    
+endmenu
+    
