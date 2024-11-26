@@ -13,14 +13,27 @@
 #include "esp_mac.h"
 #include "sdkconfig.h"
 #include "esp_random.h"
+#include "esp_adc/adc_oneshot.h"
+#include "hal/adc_types.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
 #define SAMPLE_RATE 20 // Hz
 #define QUEUE_SIZE 100
 #define SYNC_RETRY_DELAY 500 // ms
-#define MAX_SYNC_RETRIES 100
+#define MAX_SYNC_RETRIES 1000
+
+// ADC Configuration
+#define ADC_UNIT ADC_UNIT_1
+#define ADC_CHANNEL ADC_CHANNEL_0
+#define ADC_ATTEN ADC_ATTEN_DB_0
+#define ADC_BITWIDTH ADC_BITWIDTH_DEFAULT
 
 static const char *TAG = "ADC_ESP_NOW";
 static QueueHandle_t adc_data_queue;
+static adc_oneshot_unit_handle_t adc1_handle;
+static adc_cali_handle_t adc_cali_handle;
+
 // COM8
 static uint8_t unicast_address[ESP_NOW_ETH_ALEN] = {0xf4, 0x12, 0xfa, 0x88, 0x01, 0x9c}; // Replace with your target MAC address
 static bool sync_complete = false;
@@ -56,11 +69,102 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_get_channel(&primary, &second));
     ESP_LOGI(TAG, "Current Wi-Fi channel: %d", primary);
 }
+
+static void adc_init(void)
+{
+    // Initialize ADC unit
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+
+    // Configure ADC channel
+    adc_oneshot_chan_cfg_t channel_config = {
+        .bitwidth = ADC_BITWIDTH,
+        .atten = ADC_ATTEN,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL, &channel_config));
+
+    ESP_LOGI(TAG, "ADC initialized on Unit: %d, Channel: %d", ADC_UNIT, ADC_CHANNEL);
+}
+
+static void adc_cali_init()
+{
+    adc_cali_curve_fitting_config_t cali_config = {
+        .unit_id = ADC_UNIT,
+        .atten = ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH,
+    };
+
+    // Check if curve fitting calibration is supported
+    esp_err_t ret = adc_cali_create_scheme_curve_fitting(&cali_config, &adc_cali_handle);
+    if (ret == ESP_OK)
+    {
+        ESP_LOGI(TAG, "ADC calibration initialized (Curve Fitting)");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to initialize ADC calibration: %s", esp_err_to_name(ret));
+        adc_cali_handle = NULL;
+    }
+}
+
+static void adc_cali_deinit()
+{
+    if (adc_cali_handle)
+    {
+        ESP_ERROR_CHECK(adc_cali_delete_scheme_curve_fitting(adc_cali_handle));
+        ESP_LOGI(TAG, "ADC calibration deinitialized");
+    }
+}
+/**
+ * @brief ADC sampling task. Samples data at 20Hz and pushes it to the queue.
+ */
+static void adc_sampling_task(void *arg)
+{
+    int raw_data = 0;
+    int voltage = 0.0;
+    while (!sync_complete)
+    {
+        vTaskDelay(pdMS_TO_TICKS(50)); // Check every 100ms
+    }
+    while (1)
+    {
+        // Read raw ADC data
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL, &raw_data));
+        if (adc_cali_handle)
+        {
+            ESP_GOTO_ON_ERROR(adc_cali_raw_to_voltage(adc_cali_handle, raw_data, &voltage), err, TAG, "adc_cali_raw_to_voltage failed");
+            ESP_LOGI(TAG, "ADC Calibrated Voltage: %d mV", voltage);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "ADC Calibration not available, raw data: %d", raw_data);
+        }
+        // Convert raw data to voltage
+
+        // voltage = raw_data * 1.1 / (1 << 12); // Assuming 12-bit ADC resolution
+        // ESP_LOGI(TAG, "ADC Voltage: %.3f V", voltage);
+        float voltage_float = (float)voltage / 1000.0f;
+        // Push data to queue
+        if (xQueueSend(adc_data_queue, &voltage_float, pdMS_TO_TICKS(10)) != pdTRUE)
+        {
+            ESP_LOGW(TAG, "ADC queue full, sample dropped");
+        }
+        // Delay to maintain 20 Hz sample rate
+        vTaskDelay(pdMS_TO_TICKS(1000 / SAMPLE_RATE));
+    }
+
+err:
+    adc_cali_deinit();
+}
 /**
  * @brief Callback function for ESP-NOW send status.
  */
 static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
+
     if (mac_addr == NULL)
     {
         ESP_LOGE(TAG, "Send callback error: NULL MAC address");
@@ -72,8 +176,9 @@ static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status
 /**
  * @brief Callback function for ESP-NOW receive events.
  */
-static void espnow_recv_cb(const uint8_t *mac_addr, const uint8_t *data, int len)
+static void espnow_recv_cb(const esp_now_recv_info_t *messageInfo, const uint8_t *data, int len)
 {
+    const uint8_t *mac_addr = messageInfo->src_addr;
     if (mac_addr == NULL || data == NULL || len <= 0)
     {
         ESP_LOGE(TAG, "Receive callback error: invalid arguments");
@@ -103,30 +208,6 @@ static void espnow_init(void)
     };
     memcpy(peer_info.peer_addr, unicast_address, ESP_NOW_ETH_ALEN);
     ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
-}
-
-/**
- * @brief ADC sampling task. Samples data at 20Hz and pushes it to the queue.
- */
-static void adc_sampling_task(void *arg)
-{
-    float sample = 0.0f;
-
-    // Wait for synchronization to complete before starting ADC sampling
-    while (!sync_complete)
-    {
-        vTaskDelay(pdMS_TO_TICKS(100)); // Check every 100ms
-    }
-
-    while (1)
-    {
-        sample = (float)esp_random() / UINT32_MAX; // Simulate ADC float32 data
-        if (xQueueSend(adc_data_queue, &sample, pdMS_TO_TICKS(10)) != pdTRUE)
-        {
-            ESP_LOGW(TAG, "ADC queue full, sample dropped");
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000 / SAMPLE_RATE)); // Sample at the correct rate
-    }
 }
 
 /**
@@ -176,6 +257,8 @@ void app_main(void)
 
     // Initialize Wi-Fi and ESP-NOW
     wifi_init();
+    adc_init();
+    adc_cali_init();
     espnow_init();
 
     // Create the ADC data queue
